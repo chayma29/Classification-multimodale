@@ -1,0 +1,178 @@
+import json
+import os
+import torch
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from transformers import ViTForImageClassification
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import precision_recall_fscore_support, accuracy_score
+from torch.optim import Adam
+from torch.nn import BCEWithLogitsLoss
+import matplotlib.pyplot as plt
+
+# Chemins vers vos fichiers et dossiers
+json_path = 'C:\\Users\\hp\\Downloads\\DataVIT.json'
+image_folder = 'C:\\Users\\hp\\Downloads\\preprocessed_images_combined\\'
+
+# Chargement des données JSON
+with open(json_path, 'r') as f:
+    data = json.load(f)
+
+# Organiser les données par utilisateur
+user_data = {}
+for item in data:
+    user_images = [{'url': os.path.join(image_folder, os.path.basename(img['url'])), 'interests': item['interests']} for img in item['images']]
+    user_data[item['user_id']] = user_images
+
+# Créer un mappage des intérêts à des indices
+all_interests = set()
+for user_imgs in user_data.values():
+    for img in user_imgs:
+        all_interests.update(img['interests'])
+
+interest_map = {interest: idx for idx, interest in enumerate(all_interests)}
+
+# Séparation des données en fonction des utilisateurs
+user_ids = list(user_data.keys())
+train_users, test_users = train_test_split(user_ids, test_size=0.2, random_state=42)
+
+train_data = [img for user in train_users for img in user_data[user]]
+test_data = [img for user in test_users for img in user_data[user]]
+
+# Définition de la classe Dataset
+class CustomDataset(Dataset):
+    def __init__(self, data, label_map, transform=None):
+        self.data = data
+        self.transform = transform
+        self.label_map = label_map
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        image_path = self.data[idx]['url']
+        image = torch.load(image_path)
+        interests = self.data[idx]['interests']
+        labels = torch.zeros(len(self.label_map), dtype=torch.float32)
+        for interest in interests:
+            if interest in self.label_map:
+                labels[self.label_map[interest]] = 1.0
+        if self.transform:
+            image = self.transform(image)
+        return image, labels
+
+# Transformation (si nécessaire)
+transform = transforms.Compose([
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+])
+
+# Configuration du modèle
+model = ViTForImageClassification.from_pretrained(
+    'google/vit-base-patch16-224',
+    num_labels=len(interest_map),
+    ignore_mismatched_sizes=True
+)
+
+# Configuration de l'appareil
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+
+# Création des ensembles de données et Dataloader
+train_dataset = CustomDataset(train_data, interest_map, transform)
+test_dataset = CustomDataset(test_data, interest_map, transform)
+train_loader = DataLoader(train_dataset, batch_size=10, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=10, shuffle=False)
+
+# Configuration de l'entraînement
+criterion = BCEWithLogitsLoss()
+optimizer = Adam(model.parameters(), lr=5e-5)
+
+# Initialisation des listes pour stocker les métriques
+train_losses = []
+val_losses = []
+accuracies = []
+precisions = []
+recalls = []
+f1_scores = []
+
+# Boucle d'entraînement
+for epoch in range(5):
+    model.train()
+    total_loss = 0
+    total_samples = 0
+    for images, labels in train_loader:
+        images, labels = images.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(images).logits
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * images.size(0)
+        total_samples += images.size(0)
+    train_loss = total_loss / total_samples
+    train_losses.append(train_loss)
+
+    # Évaluation sur les données de validation
+    model.eval()
+    val_loss = 0
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images).logits
+            loss = criterion(outputs, labels)
+            val_loss += loss.item() * images.size(0)
+            preds = torch.sigmoid(outputs).cpu().numpy() > 0.5
+            all_preds.extend(preds)
+            all_labels.extend(labels.cpu().numpy())
+    val_loss /= total_samples
+    val_losses.append(val_loss)
+    precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average='micro')
+    accuracy = accuracy_score(all_labels, all_preds)
+    accuracies.append(accuracy)
+    precisions.append(precision)
+    recalls.append(recall)
+    f1_scores.append(f1)
+
+    print(f'Epoch {epoch+1}, Train Loss: {train_loss}, Validation Loss: {val_loss}, Accuracy: {accuracy}, Precision: {precision}, Recall: {recall}, F1-Score: {f1}')
+
+# Calcul de l'accuracy totale sur le jeu de test complet
+model.eval()
+all_preds, all_labels = [], []
+with torch.no_grad():
+    for images, labels in test_loader:
+        images, labels = images.to(device), labels.to(device)
+        outputs = model(images).logits
+        preds = torch.sigmoid(outputs).cpu().numpy() > 0.5
+        all_preds.extend(preds)
+        all_labels.extend(labels.cpu().numpy())
+total_accuracy = accuracy_score(all_labels, all_preds)
+print(f'Total Accuracy: {total_accuracy}')
+
+# Sauvegarde du modèle
+torch.save(model.state_dict(), 'C:\\Users\\hp\\Downloads\\model_vit.pth')
+
+# Tracer les graphiques des métriques
+epochs = range(1, 6)  # 5 époques
+
+plt.figure(figsize=(12, 5))
+plt.subplot(1, 2, 1)
+plt.plot(epochs, train_losses, label='Train Loss')
+plt.plot(epochs, val_losses, label='Validation Loss')
+plt.title('Training and Validation Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+
+plt.subplot(1, 2, 2)
+plt.plot(epochs, accuracies, label='Accuracy')
+plt.plot(epochs, precisions, label='Precision')
+plt.plot(epochs, recalls, label='Recall')
+plt.plot(epochs, f1_scores, label='F1 Score')
+plt.title('Performance Metrics')
+plt.xlabel('Epoch')
+plt.ylabel('Score')
+plt.legend()
+
+plt.tight_layout()
+plt.show()
